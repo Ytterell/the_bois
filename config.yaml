@@ -1,0 +1,48 @@
+agents:
+  coordinator:
+    model: "qwen2.5:14b"
+    temperature: 0.2
+    num_ctx: 16384
+    num_predict: 4096
+  architect:
+    model: "qwen2.5:14b"
+    temperature: 0.2
+    num_ctx: 16384
+    num_predict: 4096
+  coder:
+    model: "qwen2.5-coder:32b-instruct-q5_K_M"
+    temperature: 0.15
+    num_ctx: 16384
+    num_predict: 8192
+    timeout: 2400
+  reviewer:
+    model: "qwen2.5-coder:14b"
+    temperature: 0.1
+    num_ctx: 16384
+    num_predict: 4096
+  researcher:
+    model: "qwen2.5:14b"
+    temperature: 0.3
+    num_ctx: 8192
+    num_predict: 4096
+
+orchestration:
+  max_task_iterations: 5
+  max_global_iterations: 7
+  context_max_messages: 20
+  global_timeout: 14400  # 4 hours wall-clock
+
+ollama:
+  base_url: "http://localhost:11434"
+  timeout: 600
+  keep_alive: "15m"
+
+workspace:
+  path: "./workspace"
+
+memory:
+  enabled: true
+  path: "./memory"
+  embedding_model: "nomic-embed-text"
+  max_examples: 200
+  max_injection_tokens: 500
