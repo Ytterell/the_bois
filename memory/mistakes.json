@@ -2337,7 +2337,7 @@
     "agent": "coder",
     "pattern": "Test failures:\n============================= test session starts ==============================\ncollecting ... collected 20 items\n\ntests/test_main_app.py::test_main_app_initialization FAILED              [  5%]\n\n=================================== FAILURES ===================================\n_________________________ test_main_app_initialization _________________________\ntests/test_main_app.py:38: in test_main_app_initialization\n    assert hasattr(app, \"sidebar\")\nE   AssertionError: assert False\nE    +  where False = hasattr(MainApp(title='MainApp', classes={'-dark-mode'}, pseudo_classes={'focus', 'dark'}), 'sidebar')\n=========================== short test summary info ============================\nFAILED tests/test_main_app.py::test_main_app_initialization - AssertionError:...\n!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!\n============================== 1 failed in 0.11s ===============================\n\nNo entry for terminal type \"xterm-kitty\";\nusing dumb terminal settings.",
     "severity": "medium",
-    "frequency": 5,
+    "frequency": 8,
     "embedding": [
       0.019922465,
       -0.031669468,
@@ -3109,7 +3109,7 @@
       -0.084333435
     ],
     "first_seen": 1772119199.709891,
-    "last_seen": 1772152541.718466
+    "last_seen": 1772314812.7405388
   },
   {
     "agent": "coder",
