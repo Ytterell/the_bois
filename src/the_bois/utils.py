@@ -90,12 +90,33 @@ def truncate(text: str, max_length: int = 500) -> str:
     return text[: max_length - 3] + "..."
 
 
-def estimate_tokens(text: str) -> int:
-    """Rough token estimate — content-aware.
+def _get_tokenizer():
+    """Get tiktoken encoder. Falls back to heuristic if unavailable."""
+    try:
+        import tiktoken
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        return None
 
-    Code has more tokens per character than prose (~3 chars/token vs ~4).
-    Detects code-heavy content by checking for common indicators.
-    """
+
+_tokenizer = None
+
+
+def estimate_tokens(text: str) -> int:
+    """Accurate token count using tiktoken, with fallback to heuristic."""
+    global _tokenizer
+    
+    # Try tiktoken first (cached)
+    if _tokenizer is None:
+        _tokenizer = _get_tokenizer()
+    
+    if _tokenizer is not None:
+        try:
+            return len(_tokenizer.encode(text))
+        except Exception:
+            pass
+    
+    # Fallback: content-aware heuristic
     code_indicators = ("def ", "class ", "import ", "return ", "    ", "{", "}", "=>")
     code_ratio = sum(1 for ind in code_indicators if ind in text) / len(code_indicators)
     chars_per_token = 3 if code_ratio > 0.3 else 4

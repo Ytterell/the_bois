@@ -84,6 +84,15 @@ def run(
 
     config = load_config(config_path)
 
+    # ── Set up file logging before anything else ──
+    from datetime import datetime
+    from the_bois.log import setup_logging
+
+    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = Path(config.workspace.path) / f"run_{run_id}"
+    log_path = setup_logging(run_dir)
+    console.print(f"[dim]Log: {log_path}[/dim]\n")
+
     # ── Dry-run mode: mock LLM, full pipeline, zero Ollama dependency ──
     client = None
     if dry_run:
@@ -109,7 +118,7 @@ def run(
             f"{config.orchestration.max_global_iterations} global iter[/bold magenta]\n"
         )
 
-    orchestrator = Orchestrator(config, client=client)
+    orchestrator = Orchestrator(config, client=client, run_id=run_id)
     asyncio.run(orchestrator.run(scope, seed_files=seed_files or None))
 
 

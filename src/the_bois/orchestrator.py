@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel
@@ -24,10 +26,13 @@ from the_bois.memory import MemoryStore
 from the_bois.memory.ledger import Ledger, Message, MessageType
 from the_bois.models.ollama import OllamaClient
 from the_bois.tools.repair import auto_repair
+from the_bois.tools.static_check import static_check_files
+from the_bois.tools.context import chunk_files_for_context
 from the_bois.tools.validator import validate_code, validate_fast, validate_full
 from the_bois.tools.workspace import Workspace
 
 console = Console()
+log = logging.getLogger(__name__)
 
 # Agent display styles
 AGENT_STYLE = {
@@ -53,7 +58,7 @@ def agent_header(agent: str, message: str) -> Panel:
 class Orchestrator:
     """Drives the multi-agent collaboration loop."""
 
-    def __init__(self, config: Config, client=None) -> None:
+    def __init__(self, config: Config, client=None, run_id: str | None = None) -> None:
         self.config = config
         self.ledger = Ledger()
         self.client = client or OllamaClient(
@@ -62,17 +67,46 @@ class Orchestrator:
             keep_alive=config.ollama.keep_alive,
         )
         # Each run gets its own timestamped subfolder
-        self.run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.run_id = run_id or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         run_path = Path(config.workspace.path) / f"run_{self.run_id}"
         self.workspace = Workspace(run_path)
         self.agents: dict = {}
         self.research_bank: dict[str, str] = {}  # query → findings (persists entire run)
         self.reviewer_misses: int = 0  # times reviewer approved but validation rejected
-
+        
+        # Metrics tracking
+        self.static_check_failures: int = 0  # static analysis failures
+        self.fast_validation_failures: int = 0  # syntax/import failures
+        self.full_validation_failures: int = 0  # test failures
+        self.total_coder_iterations: int = 0  # total coder attempts across all tasks
+        
+        # Timing tracking
+        self.timing: dict[str, float] = {}  # agent_name -> total seconds
+        
         # Memory system
         self.memory: MemoryStore | None = None
         if config.memory.enabled:
             self.memory = MemoryStore(config.memory)
+
+    def _timed_agent_call(self, agent_name: str, coro) -> Any:
+        """Wrap an agent call with timing."""
+        import time
+        start = time.perf_counter()
+        try:
+            return coro
+        finally:
+            elapsed = time.perf_counter() - start
+            self.timing[agent_name] = self.timing.get(agent_name, 0) + elapsed
+
+    async def _timed_await(self, agent_name: str, coro) -> Any:
+        """Wrap an await with timing."""
+        import time
+        start = time.perf_counter()
+        try:
+            return await coro
+        finally:
+            elapsed = time.perf_counter() - start
+            self.timing[agent_name] = self.timing.get(agent_name, 0) + elapsed
 
     def _init_agents(self) -> None:
         """Instantiate all agents with their configs."""
@@ -136,16 +170,15 @@ class Orchestrator:
         # ── Step 0a: Coordinator analyzes scope ──
         console.print(agent_header("coordinator", "Analyzing scope for clarity..."))
         scope_with_seed = scope + seed_context if seed_context else scope
-        scope_analysis = await self.agents["coordinator"].analyze_scope(scope_with_seed)
+        scope_analysis = await self._timed_await("coordinator", self.agents["coordinator"].analyze_scope(scope_with_seed))
         refined_scope = scope_analysis.get("refined_scope", scope)
         needs_research = scope_analysis.get("needs_research", False)
         research_queries = scope_analysis.get("research_queries", [])
 
-        console.print(f"  [dim]Refined scope:[/dim] {refined_scope[:200]}")
+        log.info("Refined scope: %s", refined_scope[:500])
         if needs_research:
             console.print(f"  [magenta]Research needed: {len(research_queries)} query(ies)[/magenta]")
-        else:
-            console.print("  [dim]No research needed — proceeding directly.[/dim]")
+        log.info("Needs research: %s, queries: %s", needs_research, research_queries)
         console.print()
 
         # ── Step 0b: Researcher gathers context (if needed) ──
@@ -154,10 +187,9 @@ class Orchestrator:
             for query in research_queries:
                 console.print(agent_header("researcher", f"Researching: {query}"))
                 try:
-                    result = await self.agents["researcher"].execute({"query": query})
+                    result = await self._timed_await("researcher", self.agents["researcher"].execute({"query": query}))
                     research_findings.append({"query": query, **result})
-                    findings_preview = result.get("findings", "")[:150]
-                    console.print(f"  [dim]{findings_preview}[/dim]")
+                    log.info("Research findings for '%s': %s", query, result.get("findings", "")[:300])
 
                     # Store in persistent research bank for coder access
                     block = ""
@@ -179,18 +211,15 @@ class Orchestrator:
                     console.print(f"  [yellow]⚠ Research failed: {e}[/yellow]")
 
             if self.research_bank:
-                console.print(
-                    f"  [magenta]📚 Research bank: {len(self.research_bank)} "
-                    f"topic(s) stored for coder reference[/magenta]"
-                )
+                log.info("Research bank: %d topic(s) cached", len(self.research_bank))
             console.print()
 
         # ── Step 1: Architect decomposes the problem ──
         console.print(agent_header("architect", "Analyzing scope and creating task plan..."))
         architect_scope = refined_scope + seed_context if seed_context else refined_scope
-        plan = await self.agents["architect"].execute(
+        plan = await self._timed_await("architect", self.agents["architect"].execute(
             {"scope": architect_scope, "research": research_findings}
-        )
+        ))
         tasks = plan.get("tasks", [])
 
         if not tasks:
@@ -242,29 +271,28 @@ class Orchestrator:
                             + merged_desc
                         )
                     task = {**task, "description": merged_desc}
-                    console.print(
-                        f"  [yellow]⚠ Merging failed dep(s) {unmet} into {task['id']}[/yellow]"
-                    )
+                    log.info("Merging failed dep(s) %s into %s", unmet, task["id"])
 
                 # Build context: only relevant files for this task
                 filtered_context = self._build_coder_context(all_results, current_task=task)
 
                 result = await self._execute_task(task, filtered_context)
                 all_results[task["id"]] = result
+                
+                # Track total iterations across all tasks
+                self.total_coder_iterations += result.get("iterations", 1)
 
                 # Auto-checkpoint after approved tasks — overnight insurance
                 if result.get("review", {}).get("approved", False):
                     self._checkpoint(all_results)
                 else:
-                    console.print(
-                        f"  [yellow]⚠ Task {task['id']} failed all review attempts.[/yellow]"
-                    )
+                    console.print(f"  [yellow]⚠ Task {task['id']} failed all attempts[/yellow]")
 
             # ── Step 3: Coordinator reviews everything ──
             console.print(agent_header("coordinator", "Reviewing overall progress..."))
-            decision = await self.agents["coordinator"].execute(
+            decision = await self._timed_await("coordinator", self.agents["coordinator"].execute(
                 {"scope": refined_scope, "plan": plan, "results": all_results}
-            )
+            ))
 
             dec = decision.get("decision", "approve")
             reason = decision.get("reason", "No reason given.")
@@ -272,6 +300,30 @@ class Orchestrator:
 
             if dec == "approve":
                 console.print("[bold green]✅ The bois are satisfied. Work complete.[/bold green]\n")
+                
+                # Display run metrics
+                console.print("\n[bold]📊 Run Metrics:[/bold]")
+                console.print(f"  Total coder iterations: {self.total_coder_iterations}")
+                console.print(f"  Static check failures: {self.static_check_failures}")
+                console.print(f"  Fast validation failures: {self.fast_validation_failures}")
+                console.print(f"  Full validation failures: {self.full_validation_failures}")
+                console.print(f"  Reviewer misses: {self.reviewer_misses}")
+                
+                # Display timing breakdown
+                if self.timing:
+                    total_time = sum(self.timing.values())
+                    console.print("\n[bold]⏱️ Timing Breakdown:[/bold]")
+                    for agent, secs in sorted(self.timing.items(), key=lambda x: -x[1]):
+                        pct = (secs / total_time * 100) if total_time > 0 else 0
+                        mins, secs_remain = divmod(int(secs), 60)
+                        if mins:
+                            console.print(f"  {agent}: {mins}m {secs_remain}s ({pct:.1f}%)")
+                        else:
+                            console.print(f"  {agent}: {secs_remain}s ({pct:.1f}%)")
+                    console.print(f"  Total: {int(total_time)}s")
+                
+                console.print()
+                
                 break
 
             elif dec == "rework":
@@ -285,9 +337,9 @@ class Orchestrator:
             elif dec == "replan":
                 console.print("[yellow]↻ Coordinator wants a full replan...[/yellow]\n")
                 console.print(agent_header("architect", "Re-planning based on feedback..."))
-                plan = await self.agents["architect"].execute(
+                plan = await self._timed_await("architect", self.agents["architect"].execute(
                     {"scope": refined_scope, "feedback": reason, "research": research_findings}
-                )
+                ))
                 tasks = plan.get("tasks", [])
                 if not tasks:
                     console.print("[bold red]Architect produced no tasks on replan. Stopping.[/bold red]")
@@ -386,8 +438,15 @@ class Orchestrator:
         # Single entry with all unique files — coder/reviewer see each
         # file exactly once regardless of how many tasks touched it.
         if files_by_path:
+            files_list = list(files_by_path.values())
+            
+            # Chunk large files based on task description for token optimization
+            if current_task:
+                task_desc = current_task.get("description", "")
+                files_list = chunk_files_for_context(files_list, task_desc)
+            
             context["_codebase"] = {
-                "code": {"files": list(files_by_path.values())},
+                "code": {"files": files_list},
                 "review": {"approved": True},
             }
 
@@ -438,10 +497,7 @@ class Orchestrator:
                 changed_files.append(f)
 
         if unchanged_paths:
-            console.print(
-                f"  [dim]📎 Stripped {len(unchanged_paths)} unchanged file(s): "
-                f"{', '.join(unchanged_paths)}[/dim]"
-            )
+            log.info("Stripped %d unchanged file(s): %s", len(unchanged_paths), unchanged_paths)
 
         filtered = {**code_result, "files": changed_files}
         return filtered, unchanged_paths
@@ -469,21 +525,19 @@ class Orchestrator:
             if iteration > 0:
                 ramped = min(base_temp + 0.2 * iteration, 1.0)
                 coder_agent._temperature_override = ramped
-                console.print(f"  [dim]🌡 Temperature ramped to {ramped:.1f}[/dim]")
+                log.info("Temperature ramped to %.1f for %s", ramped, task_id)
             else:
                 coder_agent._temperature_override = None
 
             # Coder writes
             console.print(agent_header("coder", f"Task: {task['title']} {iter_label}"))
-            code_result = await coder_agent.execute(
-                {
-                    "task": task,
-                    "feedback": feedback,
-                    "context": existing_results,
-                    "failure_history": failure_history,
-                    "research_bank": self.research_bank,
-                }
-            )
+            code_result = await self._timed_await("coder", coder_agent.execute({
+                "task": task,
+                "feedback": feedback,
+                "context": existing_results,
+                "failure_history": failure_history,
+                "research_bank": self.research_bank,
+            }))
 
             # Handle ALREADY_DONE signal — coder says existing code covers this
             if code_result.get("already_done"):
@@ -532,10 +586,9 @@ class Orchestrator:
             )
             changed_files = review_code.get("files", [])
 
-            for f in changed_files:
-                console.print(f"  [green]📄 {f['path']}[/green]")
+            log.info("Coder output files: %s", [f['path'] for f in changed_files])
             if code_result.get("explanation"):
-                console.print(f"  [dim]{code_result['explanation'][:200]}[/dim]")
+                log.info("Coder explanation: %s", code_result['explanation'][:300])
 
             # Circuit breaker: detect identical consecutive outputs
             # (use raw_files for this — unchanged stripping shouldn't
@@ -554,21 +607,52 @@ class Orchestrator:
             raw_files_for_repair = code_result.get("files", [])
             _, repairs_made = auto_repair(raw_files_for_repair)
             if repairs_made:
-                console.print(f"  [cyan]🔧 Auto-repaired: {', '.join(repairs_made)}[/cyan]")
+                log.info("Auto-repaired: %s", repairs_made)
+
+            # ── STATIC CHECK: AST-based structural verification ──
+            all_files = self._collect_all_files(existing_results, code_result)
+            static_result = static_check_files(all_files)
+            
+            if not static_result.passed:
+                console.print(f"  [yellow]⚠ Static analysis: {len(static_result.errors)} issue(s)[/yellow]")
+                for err in static_result.errors:
+                    log.info("Static: %s:%s — %s", err.file, err.line, err.message)
+                
+                # Build feedback for coder
+                static_feedback = {
+                    "approved": False,
+                    "issues": [e.to_reviewer_format() for e in static_result.errors],
+                    "summary": f"Static analysis found {len(static_result.errors)} structural issue(s) that will cause runtime errors.",
+                }
+                
+                # Log to ledger
+                self.ledger.append(Message(
+                    from_agent="static_checker",
+                    to_agent="coder",
+                    message_type=MessageType.VALIDATION,
+                    content=static_feedback["summary"],
+                    metadata={"task_id": task_id},
+                ))
+                
+                failure_history.append(
+                    f"Attempt {iteration + 1}: STATIC CHECK — {len(static_result.errors)} issue(s)"
+                )
+                
+                self.static_check_failures += 1
+                review_result = static_feedback
+                continue
+
+            log.debug("Static analysis passed for %s", task_id)
 
             # ── FAST VALIDATION: syntax + imports before wasting reviewer time ──
-            all_files = self._collect_all_files(existing_results, code_result)
-            console.print("  [dim]⚙ Fast validation (syntax + imports)...[/dim]")
             fast_result = validate_fast(all_files)
 
             if not fast_result.passed:
                 # Code is broken — skip the reviewer entirely and feed
                 # errors directly back to the coder.
-                console.print("  [bold red]✗ Fast validation FAILED — skipping reviewer[/bold red]")
+                console.print(f"  [bold red]✗ Fast validation FAILED ({len(fast_result.errors)} error(s))[/bold red]")
                 for err in fast_result.errors:
-                    for line in err.split("\n")[:3]:
-                        console.print(f"    [red]{line[:150]}[/red]")
-                console.print()
+                    log.info("Fast validation error: %s", err[:300])
 
                 feedback = fast_result.as_feedback()
 
@@ -588,6 +672,7 @@ class Orchestrator:
                 failure_history.append(
                     f"Attempt {iteration + 1}: SYNTAX/IMPORT — {val_summary[:150]}"
                 )
+                self.fast_validation_failures += 1
 
                 research_ctx = await self._research_errors(fast_result, all_files)
                 if research_ctx:
@@ -596,11 +681,9 @@ class Orchestrator:
                 review_result = feedback
                 continue
 
-            console.print("  [green]✓ Syntax + imports OK[/green]")
-
             # ── REVIEWER: code compiles, now check logic/completeness ──
             console.print(agent_header("reviewer", f"Reviewing: {task['title']} {iter_label}"))
-            review_result = await self.agents["reviewer"].execute(
+            review_result = await self._timed_await("reviewer", self.agents["reviewer"].execute(
                 {
                     "task": task,
                     "code": review_code,
@@ -608,7 +691,7 @@ class Orchestrator:
                     "unchanged_files": unchanged_paths,
                     "last_validation_error": last_validation_error,
                 }
-            )
+            ))
 
             approved = review_result.get("approved", False)
             summary = review_result.get("summary", "No summary.")
@@ -618,7 +701,6 @@ class Orchestrator:
                 console.print(f"  [green]✓ Approved:[/green] {summary}")
 
                 # ── FULL VALIDATION: run tests now that reviewer is happy ──
-                console.print("  [dim]⚙ Full validation (+ tests)...[/dim]")
                 validation = validate_full(all_files)
 
                 if validation.passed:
@@ -629,11 +711,9 @@ class Orchestrator:
                     break
 
                 # Tests failed — override reviewer approval
-                console.print("  [bold red]✗ Full validation FAILED (tests crash/fail)[/bold red]")
+                console.print(f"  [bold red]✗ Validation FAILED ({len(validation.errors)} error(s))[/bold red]")
                 for err in validation.errors:
-                    for line in err.split("\n")[:3]:
-                        console.print(f"    [red]{line[:150]}[/red]")
-                console.print()
+                    log.info("Full validation error: %s", err[:500])
 
                 feedback = validation.as_feedback()
 
@@ -651,6 +731,7 @@ class Orchestrator:
                 ))
 
                 self.reviewer_misses += 1
+                self.full_validation_failures += 1
                 last_validation_error = val_summary
 
                 failure_history.append(
@@ -667,10 +748,7 @@ class Orchestrator:
             # Reviewer rejected
             console.print(f"  [red]✗ Rejected:[/red] {summary}")
             for issue in issues:
-                sev = issue.get("severity", "?")
-                desc = issue.get("description", "")
-                console.print(f"    [red]• [{sev}][/red] {desc}")
-            console.print()
+                log.info("Reviewer issue [%s]: %s", issue.get("severity", "?"), issue.get("description", ""))
 
             last_validation_error = None
             rejection_reason = summary[:120]
@@ -693,10 +771,7 @@ class Orchestrator:
 
         # Log reviewer accuracy for this task
         if self.reviewer_misses > 0:
-            console.print(
-                f"  [dim yellow]⚠ Reviewer missed {self.reviewer_misses} "
-                f"runtime error(s) so far this run[/dim yellow]"
-            )
+            log.info("Reviewer misses so far: %d", self.reviewer_misses)
 
         return {
             "task": task,
@@ -704,6 +779,9 @@ class Orchestrator:
             "review": review_result,
             "iterations": iteration + 1,
             "reviewer_misses": self.reviewer_misses,
+            "static_check_failures": self.static_check_failures,
+            "fast_validation_failures": self.fast_validation_failures,
+            "full_validation_failures": self.full_validation_failures,
         }
 
     # ── Reactive research helpers ─────────────────────────────────── #
@@ -876,13 +954,13 @@ class Orchestrator:
         for query in queries:
             # Check cache first
             if query in self.research_bank:
-                console.print(f"  [dim]🔎 Using cached research: {query[:60]}[/dim]")
+                log.debug("Using cached research for: %s", query[:80])
                 findings_parts.append(self.research_bank[query])
                 continue
 
             console.print(agent_header("researcher", f"Looking up: {query[:80]}"))
             try:
-                result = await self.agents["researcher"].execute({"query": query})
+                result = await self._timed_await("researcher", self.agents["researcher"].execute({"query": query}))
                 findings = result.get("findings", "")
                 code_ref = result.get("relevant_code", "")
                 key_points = result.get("key_points", [])
@@ -900,11 +978,11 @@ class Orchestrator:
                 if block:
                     self.research_bank[query] = block
                     findings_parts.append(block)
-                    console.print(f"  [dim]{findings[:120]}[/dim]")
+                    log.info("Research findings: %s", findings[:200])
                 else:
-                    console.print("  [yellow]No useful findings.[/yellow]")
+                    log.info("No useful research findings for: %s", query)
             except Exception as e:
-                console.print(f"  [yellow]⚠ Research failed: {e}[/yellow]")
+                log.warning("Research failed for '%s': %s", query, e)
 
         if not findings_parts:
             return ""
@@ -967,7 +1045,7 @@ class Orchestrator:
             if path.endswith(".py"):
                 try:
                     compile(fdict["content"], path, "exec")
-                    console.print(f"  [green]✓ {path} — syntax OK[/green]")
+                    log.debug("Final syntax OK: %s", path)
                 except SyntaxError as e:
                     console.print(
                         f"  [bold red]✗ {path} — syntax error: "
@@ -1090,13 +1168,10 @@ class Orchestrator:
         # Ledger snapshot
         self.ledger.save(self.workspace.path / "ledger.json")
 
-        console.print(
-            f"  [dim]💾 Checkpoint: {approved_count} task(s) approved, "
-            f"{file_count} file(s) saved[/dim]"
-        )
+        log.info("Checkpoint: %d task(s) approved, %d file(s) saved", approved_count, file_count)
 
     def _save_state(self) -> None:
         """Persist the ledger for debugging / resume."""
         ledger_path = self.workspace.path / "ledger.json"
         self.ledger.save(ledger_path)
-        console.print(f"[dim]Ledger saved: {ledger_path} ({self.ledger.count} messages)[/dim]")
+        log.info("Ledger saved: %s (%d messages)", ledger_path, self.ledger.count)

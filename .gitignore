@@ -11,3 +11,4 @@ venv/
 workspace/*
 !workspace/.gitkeep
 .DS_Store
+AGENTS.md

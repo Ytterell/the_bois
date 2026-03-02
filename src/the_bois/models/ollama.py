@@ -87,13 +87,15 @@ class OllamaClient:
                 response.raise_for_status()
                 data = response.json()
 
-                return OllamaResponse(
+                resp = OllamaResponse(
                     content=data["message"]["content"],
                     model=data.get("model", model),
                     total_duration=data.get("total_duration"),
                     prompt_eval_count=data.get("prompt_eval_count"),
                     eval_count=data.get("eval_count"),
                 )
+                _log_metrics(resp)
+                return resp
             except _RETRYABLE as e:
                 if attempt < retries:
                     wait = 2 ** (attempt + 1)  # 2s, 4s
@@ -190,13 +192,15 @@ class OllamaClient:
         response.raise_for_status()
         data = response.json()
 
-        return OllamaResponse(
+        resp = OllamaResponse(
             content=data["response"],
             model=data.get("model", model),
             total_duration=data.get("total_duration"),
             prompt_eval_count=data.get("prompt_eval_count"),
             eval_count=data.get("eval_count"),
         )
+        _log_metrics(resp)
+        return resp
 
     async def embed(
         self,
@@ -231,3 +235,12 @@ class OllamaClient:
 
     async def close(self) -> None:
         await self._client.aclose()
+
+
+def _log_metrics(resp: OllamaResponse) -> None:
+    """Log response metrics to file — the whole reason we track these."""
+    dur = f"{resp.total_duration / 1e9:.1f}s" if resp.total_duration else "?"
+    log.info(
+        "Ollama %s — %s, prompt_tokens=%s, eval_tokens=%s",
+        resp.model, dur, resp.prompt_eval_count, resp.eval_count,
+    )
