@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
+import logging
+import re
+
 from the_bois.agents.base import BaseAgent
+from the_bois.contracts import CodeOutput, FileSpec
 from the_bois.memory.ledger import MessageType
 from the_bois.tools.validator import sanitize_code
-from the_bois.utils import parse_delimited_files, strip_markdown_fences
+from the_bois.utils import estimate_tokens, parse_delimited_files, strip_markdown_fences
+
+log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
-You are the Coder. You write production-quality code.
+You are the Coder. You write production-quality, RUNNABLE code.
 
 RULE 1 (HIGHEST PRIORITY) — SELF-CHECK:
-Before outputting, verify:
+Before outputting, verify your code against this checklist:
   ✓ Every function called has a matching `def` or import
-  ✓ No `pass` placeholders or TODO comments exist
+  ✓ No `pass` placeholders or TODO comments exist — every function has real code
   ✓ No NameError, ImportError, or SyntaxError would occur at runtime
   ✓ Every attribute access (widget.value, obj.method()) uses a REAL attribute \
 that exists on that type — do NOT guess API names
+  ✓ The main app file has an entrypoint (see RULE 7)
+  ✓ The code can actually be imported AND executed end-to-end
+  ✓ Event handlers, callbacks, and message classes use the CORRECT base classes \
+and signatures from the framework (see RULE 8)
+  ✓ ALL files requested by the task are present in your output
+  ✓ Test files import from YOUR generated modules (not phantom packages)
+  ✓ Cross-file imports match: if file A imports from file B, file B defines \
+what file A expects
 
 RULE 2 — COMPLETE CODE ONLY:
 - ALL necessary code — no placeholders, no stubs, no "implement later"
@@ -36,11 +50,52 @@ RULE 5 — ALREADY DONE:
 - If the task is ALREADY fully satisfied by existing code: respond ALREADY_DONE
 - Only use this if 100% certain. NEVER use after receiving rejection feedback.
 
+RULE 6 — REQUEST RESEARCH:
+- If you are unsure about a library's API and no API REFERENCE section is
+  available (or the reference doesn't cover what you need), output:
+  NEEDS_RESEARCH: <specific query about what you need>
+  Example: NEEDS_RESEARCH: textual ListView widget events attributes methods
+- Do NOT guess API names. If you don't know them, request research.
+- Only use this ONCE per attempt. After receiving research results, you MUST
+  produce code on the next attempt.
+
+RULE 7 — RUNNABLE ENTRYPOINT:
+- The main application file MUST include an entrypoint that can actually run:
+  if __name__ == "__main__":
+      app = MyApp()
+      app.run()  # or equivalent for the framework
+- Without this, the code is USELESS. A user must be able to run your code.
+- NEVER use blocking calls like input(), time.sleep(), or synchronous I/O \
+inside an async/event-driven application. Use the framework's own mechanisms \
+for user input (dialogs, input widgets, events).
+
+RULE 8 — API REFERENCE IS LAW:
+- When an API REFERENCE section is provided in the prompt, treat it as the
+  ABSOLUTE source of truth. Use ONLY the exact class names, method names,
+  constructor arguments, and event types shown in the reference.
+- If the reference shows `class Foo(Bar)`, you MUST inherit from `Bar`.
+- If the reference shows `widget.text` as the attribute, do NOT use `widget.value`.
+- If the reference shows events as `SomeWidget.Changed`, handle them as
+  `on_some_widget_changed(self, event: SomeWidget.Changed)`.
+- Custom messages MUST inherit from the framework's Message/Event base class.
+- NEVER mix patterns from different frameworks (e.g. tkinter patterns in a
+  textual app, flask patterns in a django app).
+
 WHEN WRITING TESTS:
 - Import and instantiate the project's main classes
 - Call actual public methods and event handlers, not just helpers
 - Use the framework's test harness if available
 - Every test must assert something concrete
+
+SANDBOX CONSTRAINTS (tests run in an isolated environment):
+- Third-party packages from the project's venv MAY be available
+- If your tests fail with "Ran 0 tests", it usually means:
+  a) Your test file has an import error that prevents loading
+  b) You used pytest fixtures but pytest is not available — use unittest.TestCase
+  c) Test functions don't start with test_
+- Prefer unittest.TestCase for maximum compatibility
+- Use unittest.mock for mocking, not pytest-specific mocking
+- Use tempfile.mkdtemp() instead of pytest's tmp_path fixture
 
 OUTPUT FORMAT (use exactly this — no JSON, no markdown fences):
 
@@ -101,35 +156,119 @@ class CoderAgent(BaseAgent):
 
         failure_history: list[str] = input_data.get("failure_history", [])
         research_bank: dict[str, str] = input_data.get("research_bank", {})
+        scope: str = input_data.get("scope", "")
+        plan_tasks: list[dict] = input_data.get("plan_tasks", [])
+        workspace_manifest: str = input_data.get("workspace_manifest", "")
 
         # ── Prompt ordering: least → most important (recency bias) ──
         # Local models attend most to what appears LAST in the prompt.
-        # Order: reference → codebase context → history → feedback → TASK
+        # Order: big picture → reference → codebase → history → feedback → TASK
         prompt = ""
 
+        # 0. Big picture — what the overall project is and where this task fits
+        if scope or plan_tasks:
+            prompt += "\n**🎯 PROJECT OVERVIEW (your task is ONE piece of this):**\n"
+            if scope:
+                prompt += f"Goal: {scope[:500]}\n"
+            if plan_tasks:
+                task_id = task.get("id", "")
+                prompt += "Tasks in this project:\n"
+                for pt in plan_tasks:
+                    marker = " ◀ YOU ARE HERE" if pt.get("id") == task_id else ""
+                    prompt += f"  {pt.get('id', '?')}: {pt.get('title', '?')}{marker}\n"
+            prompt += "\n"
+
+        # 0.5. Workspace manifest — compact summary of existing files and symbols
+        if workspace_manifest:
+            prompt += (
+                "\n**Existing workspace files (DO NOT recreate these unless "
+                "you need to modify them):**\n"
+                f"{workspace_manifest}\n\n"
+            )
+
         # 1. Research bank (reference material — consult as needed)
+        #    Filter by relevance to current task to avoid blowing context
         if research_bank:
-            prompt += "\n**📚 API REFERENCE (from documentation — use these correct "\
-                "names, do NOT guess API names):**\n"
-            for _query, ref in research_bank.items():
-                prompt += f"{ref}\n\n"
-            prompt += "---\n\n"
+            task_words = set(
+                w.lower()
+                for w in re.findall(
+                    r"[a-zA-Z_][a-zA-Z0-9_]*",
+                    f"{task.get('title', '')} {task.get('description', '')} "
+                    f"{' '.join(task.get('dependencies', []))}",
+                )
+                if len(w) > 2
+            )
+            scored: list[tuple[int, str, str]] = []
+            for query, ref in research_bank.items():
+                ref_lower = f"{query} {ref}".lower()
+                score = sum(1 for w in task_words if w in ref_lower)
+                scored.append((score, query, ref))
+            scored.sort(reverse=True)
+
+            # Include top-scoring entries (at least score > 0), cap at 5
+            relevant = [(q, r) for s, q, r in scored if s > 0][:5]
+            # Always include all if there are ≤ 3 total entries
+            if len(research_bank) <= 3:
+                relevant = list(research_bank.items())
+
+            if relevant:
+                prompt += (
+                    "\n**📚 API REFERENCE (from documentation — use these correct "
+                    "names, do NOT guess API names):**\n"
+                )
+                for _query, ref in relevant:
+                    prompt += f"{ref}\n\n"
+                prompt += "---\n\n"
 
         # 2. Existing codebase files (context for what already exists)
+        #    This is the biggest compressible chunk.  If the prompt is getting
+        #    too fat, progressively compress code to fit the context window.
         if context:
-            existing_files = ""
-            for task_id, result in context.items():
+            # Collect all files from context
+            context_files: list[dict] = []
+            for task_id_key, result in context.items():
                 for f in result.get("code", {}).get("files", []):
+                    context_files.append({"path": f["path"], "content": f["content"]})
+
+            if context_files:
+                # Estimate how many tokens we have left for code context.
+                # Budget = input_budget - system_prompt - non-code prompt so far
+                # Leave headroom for the rest of the prompt (task desc, feedback, etc.)
+                ctx_limit = self.config.num_ctx or 4096
+                predict_budget = self.config.num_predict or 2048
+                input_budget = ctx_limit - predict_budget
+                sys_tokens = estimate_tokens(self.system_prompt)
+                prompt_so_far_tokens = estimate_tokens(prompt)
+                # Reserve ~800 tokens for task desc, feedback, plan, ledger, memory
+                reserved = 800
+                code_budget = max(
+                    input_budget - sys_tokens - prompt_so_far_tokens - reserved,
+                    200,  # absolute minimum
+                )
+
+                from the_bois.tools.context import compress_code_context
+
+                compressed_files, comp_level = compress_code_context(
+                    context_files,
+                    max_tokens=code_budget,
+                )
+
+                existing_files = ""
+                for f in compressed_files:
                     existing_files += (
                         f"\n---FILE: {f['path']}---\n{f['content']}\n---END---\n"
                     )
 
-            if existing_files:
-                prompt += (
+                header = (
                     "\n**Current codebase (you MUST preserve ALL existing "
                     "code and add your new functionality):**\n"
-                    f"{existing_files}\n"
                 )
+                if comp_level >= 2:
+                    header = (
+                        "\n**Current codebase (COMPRESSED — signatures/names only "
+                        "due to context limits; preserve all existing code):**\n"
+                    )
+                prompt += f"{header}{existing_files}\n"
 
         # 3. Failure history (brief — what went wrong before)
         if failure_history:
@@ -177,9 +316,13 @@ class CoderAgent(BaseAgent):
                 f"Before coding, describe your implementation plan for this task:\n"
                 f"Title: {task['title']}\n"
                 f"Description: {task['description']}\n\n"
-                f"List: what files you'll create, what classes/functions each will "
-                f"contain, what imports you need, and any edge cases to handle.\n"
-                f"Be concise — 5-10 lines max."
+                f"List:\n"
+                f"1. Files to create and the main class/function in each\n"
+                f"2. EXACT imports needed (use names from the API REFERENCE if provided)\n"
+                f"3. Which file has the entrypoint (if __name__ == '__main__')\n"
+                f"4. Event handlers / message classes and their EXACT base classes\n"
+                f"5. Any edge cases\n"
+                f"Be concise — 5-10 lines max. Reference ONLY real API names."
             )
             # Use the base think() (non-streaming, cheap) for planning
             plan = await self.think(
@@ -211,7 +354,10 @@ class CoderAgent(BaseAgent):
                 content="ALREADY_DONE",
                 metadata={"task_id": task.get("id", "unknown")},
             )
-            return {"files": [], "explanation": "Task already done.", "already_done": True}
+            return CodeOutput(
+                explanation="Task already done.",
+                already_done=True,
+            ).to_dict()
 
         self.post_message(
             to_agent="reviewer",
@@ -230,26 +376,37 @@ class CoderAgent(BaseAgent):
             explanation = ""
             expl_match = raw.split("---FILE:")[0].strip()
             if expl_match.upper().startswith("EXPLANATION:"):
-                explanation = expl_match[len("EXPLANATION:"):].strip()
-            return {"files": files, "explanation": explanation}
+                explanation = expl_match[len("EXPLANATION:") :].strip()
+            return CodeOutput(
+                files=[FileSpec.from_dict(f) for f in files],
+                explanation=explanation,
+                raw_output=raw,
+            ).to_dict()
 
         # Fallback: maybe the model still output JSON (old habit)
         from the_bois.utils import parse_json_response
+
         parsed = parse_json_response(raw)
         if parsed and "files" in parsed:
             # Strip markdown fences from any file contents
             for f in parsed["files"]:
-                f["content"] = sanitize_code(strip_markdown_fences(f.get("content", "")))
-            return parsed
+                f["content"] = sanitize_code(
+                    strip_markdown_fences(f.get("content", ""))
+                )
+            return CodeOutput(
+                files=[FileSpec.from_dict(f) for f in parsed["files"]],
+                raw_output=raw,
+            ).to_dict()
 
         # Last resort: treat the whole response as a single file
         content = sanitize_code(strip_markdown_fences(raw))
-        return {
-            "files": [
-                {
-                    "path": f"{task.get('id', 'output')}.py",
-                    "content": content,
-                }
+        return CodeOutput(
+            files=[
+                FileSpec(
+                    path=f"{task.get('id', 'output')}.py",
+                    content=content,
+                )
             ],
-            "explanation": "Raw output — model did not return structured format.",
-        }
+            explanation="Raw output — model did not return structured format.",
+            raw_output=raw,
+        ).to_dict()

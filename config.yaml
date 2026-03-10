@@ -12,7 +12,7 @@ agents:
   coder:
     model: "qwen2.5-coder:32b-instruct-q5_K_M"
     temperature: 0.15
-    num_ctx: 16384
+    num_ctx: 32768
     num_predict: 8192
     timeout: 2400
   reviewer:
@@ -23,7 +23,7 @@ agents:
   researcher:
     model: "qwen2.5:14b"
     temperature: 0.3
-    num_ctx: 8192
+    num_ctx: 16384
     num_predict: 4096
 
 orchestration:

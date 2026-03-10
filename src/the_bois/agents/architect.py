@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from the_bois.agents.base import BaseAgent
+from the_bois.contracts import TaskSpec
 from the_bois.memory.ledger import MessageType
 from the_bois.utils import parse_json_response
 
@@ -54,6 +55,20 @@ test and expected assertions.
 - One FINAL task may run all tests together for integration, but it must \
 NOT rewrite code from previous tasks.
 
+RULE 6 — STRUCTURED TASK FIELDS (OPTIONAL BUT RECOMMENDED):
+For each task, you MAY include these extra fields for mechanical verification:
+- "required_files": list of file paths the task must produce (e.g. ["src/store.py", "tests/test_store.py"])
+- "required_signatures": list of function/method signatures that MUST exist in the output. Each entry is an object with:
+    - "file": the file path (required)
+    - "name": function/method name (required)
+    - "class_name": class name if this is a method (optional, "" for top-level functions)
+    - "params": parameter string for documentation, e.g. "key: str, value: str" (optional)
+    - "return_type": return type for documentation, e.g. "list[TodoItem]" (optional)
+- "acceptance_criteria": list of specific, testable assertions (e.g. ["load() returns [] on FileNotFoundError", "save() writes valid JSON"])
+
+These fields are machine-checked BEFORE the reviewer sees the code. \
+Missing functions = instant rejection, no wasted reviewer time.
+
 EXAMPLE (for format reference only):
 
 Scope: "Build a CLI todo app that stores tasks in a JSON file."
@@ -71,14 +86,30 @@ keys title, done, created_at. Tests: test add() creates item with correct \
 title and done=False, test complete() toggles done to True, test \
 delete() removes item, test save()/load() round-trip preserves all fields, \
 test load() on missing file returns []. Use tmp_path fixture.", \
-"dependencies": []}, {"id": "task_2", "title": "CLI interface", \
+"dependencies": [], \
+"required_files": ["todo_app.py", "tests/test_todo.py"], \
+"required_signatures": [ \
+  {"file": "todo_app.py", "name": "load", "class_name": "TodoStore", "params": "", "return_type": "list[TodoItem]"}, \
+  {"file": "todo_app.py", "name": "save", "class_name": "TodoStore", "params": "items: list[TodoItem]", "return_type": "None"}, \
+  {"file": "todo_app.py", "name": "add", "class_name": "TodoStore", "params": "title: str", "return_type": "TodoItem"}, \
+  {"file": "todo_app.py", "name": "complete", "class_name": "TodoStore", "params": "index: int", "return_type": "None"}, \
+  {"file": "todo_app.py", "name": "delete", "class_name": "TodoStore", "params": "index: int", "return_type": "None"}, \
+  {"file": "todo_app.py", "name": "list_all", "class_name": "TodoStore", "params": "", "return_type": "list[TodoItem]"} \
+], \
+"acceptance_criteria": ["load() returns [] on FileNotFoundError", "save()/load() round-trip preserves all fields", "complete() toggles done to True"]}, \
+{"id": "task_2", "title": "CLI interface", \
 "description": "Implement CLI using argparse with subcommands: add \
 (positional title arg), list (no args, prints numbered list), complete \
 (positional index arg), delete (positional index arg). main() creates \
 TodoStore('./todos.json'), dispatches to methods, prints results to stdout. \
 Exit code 1 on errors. Tests: test each subcommand with subprocess or \
 by calling main() directly, verify stdout contains expected output.", \
-"dependencies": ["task_1"]}]}
+"dependencies": ["task_1"], \
+"required_files": ["todo_app.py"], \
+"required_signatures": [ \
+  {"file": "todo_app.py", "name": "main", "class_name": "", "params": "", "return_type": "None"} \
+], \
+"acceptance_criteria": ["exit code 1 on invalid subcommand", "list subcommand prints numbered items"]}]}
 
 (End of example.)
 
@@ -89,7 +120,10 @@ Respond with ONLY valid JSON:
       "id": "task_1",
       "title": "Short descriptive title",
       "description": "DETAILED: classes, methods, params, return types, error handling, data formats. Tests: what to test and expected assertions.",
-      "dependencies": []
+      "dependencies": [],
+      "required_files": ["path/to/file.py"],
+      "required_signatures": [{"file": "path/to/file.py", "name": "func_name", "class_name": "", "params": "", "return_type": ""}],
+      "acceptance_criteria": ["specific testable assertion"]
     }
   ]
 }
@@ -132,16 +166,13 @@ class ArchitectAgent(BaseAgent):
 
         parsed = parse_json_response(raw)
         if parsed and "tasks" in parsed:
-            return parsed
+            tasks = [TaskSpec.from_dict(t) for t in parsed["tasks"]]
+            return {"tasks": [t.to_dict() for t in tasks]}
 
         # Fallback: wrap raw text as a single task
-        return {
-            "tasks": [
-                {
-                    "id": "task_1",
-                    "title": "Full implementation",
-                    "description": raw,
-                    "dependencies": [],
-                }
-            ]
-        }
+        fallback = TaskSpec(
+            id="task_1",
+            title="Full implementation",
+            description=raw,
+        )
+        return {"tasks": [fallback.to_dict()]}

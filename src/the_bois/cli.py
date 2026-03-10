@@ -27,10 +27,14 @@ def run(
         None, "--from", help="Path to a previous run folder to build upon"
     ),
     dry_run: bool = typer.Option(
-        False, "--dry-run", help="Mock LLM calls — exercises the full pipeline in seconds",
+        False,
+        "--dry-run",
+        help="Mock LLM calls — exercises the full pipeline in seconds",
     ),
     smoke: bool = typer.Option(
-        False, "--smoke", help="Real models, trivial scope, minimal iterations (~2-3 min)",
+        False,
+        "--smoke",
+        help="Real models, trivial scope, minimal iterations (~2-3 min)",
     ),
 ) -> None:
     """Submit a problem scope for the bois to tackle."""
@@ -67,6 +71,7 @@ def run(
         ckpt_path = from_run / "checkpoint.json"
         if ckpt_path.exists():
             import json
+
             try:
                 ckpt = json.loads(ckpt_path.read_text())
                 approved = sum(1 for v in ckpt.values() if v.get("approved"))
@@ -125,10 +130,14 @@ def run(
 @app.command(name="seed-memory")
 def seed_memory(
     examples_file: Path = typer.Argument(
-        ..., help="JSON file with gold/anti examples to seed into memory",
+        ...,
+        help="JSON file with gold/anti examples to seed into memory",
     ),
     config_path: Path = typer.Option(
-        "config.yaml", "--config", "-c", help="Path to config file",
+        "config.yaml",
+        "--config",
+        "-c",
+        help="Path to config file",
     ),
 ) -> None:
     """Seed the memory system with gold examples from a JSON file.
@@ -181,7 +190,9 @@ def seed_memory(
             rejection = entry.get("rejection_reason", "")
 
             if not task_desc:
-                console.print(f"  [yellow]\u26a0 Skipping entry with no task_description[/yellow]")
+                console.print(
+                    f"  [yellow]\u26a0 Skipping entry with no task_description[/yellow]"
+                )
                 continue
 
             console.print(f"  [dim]Embedding: {task_desc[:80]}...[/dim]")
@@ -226,6 +237,33 @@ def status() -> None:
         await client.close()
 
     asyncio.run(_check())
+
+
+@app.command()
+def trace(
+    run_dir: Path = typer.Argument(
+        ...,
+        help="Path to a run directory (e.g. workspace/run_2026-03-10_12-00-00)",
+    ),
+) -> None:
+    """Display a timing trace summary for a completed run."""
+    from the_bois.tools.tracing import RunTracer
+
+    trace_path = run_dir / "trace.jsonl"
+    if not trace_path.exists():
+        console.print(
+            f"[bold red]✗ No trace file found at {trace_path}[/bold red]\n"
+            "  This run may predate tracing support, or was interrupted before any spans completed."
+        )
+        raise typer.Exit(1)
+
+    spans = RunTracer.load_trace(trace_path)
+    if not spans:
+        console.print("[yellow]Trace file is empty — no spans recorded.[/yellow]")
+        raise typer.Exit(0)
+
+    summary = RunTracer.render_summary(spans)
+    console.print(Panel(summary, title="[bold]⏱️ Run Trace[/bold]", border_style="cyan"))
 
 
 def main() -> None:

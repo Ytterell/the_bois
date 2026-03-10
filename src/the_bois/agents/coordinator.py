@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from the_bois.agents.base import BaseAgent
+from the_bois.contracts import ConvergenceDecision, ScopeAnalysis
 from the_bois.memory.ledger import MessageType
 from the_bois.utils import parse_json_response
 
@@ -94,8 +95,7 @@ class CoordinatorAgent(BaseAgent):
         self._active_prompt = SCOPE_ANALYSIS_PROMPT
         try:
             prompt = (
-                f"Analyze this project scope and produce a refined version:\n\n"
-                f"{scope}"
+                f"Analyze this project scope and produce a refined version:\n\n{scope}"
             )
 
             _SCOPE_SCHEMA = {
@@ -119,14 +119,10 @@ class CoordinatorAgent(BaseAgent):
 
             parsed = parse_json_response(raw)
             if parsed and "refined_scope" in parsed:
-                return parsed
+                return ScopeAnalysis.from_dict(parsed).to_dict()
 
             # Fallback: use original scope, skip research
-            return {
-                "refined_scope": scope,
-                "needs_research": False,
-                "research_queries": [],
-            }
+            return ScopeAnalysis(refined_scope=scope).to_dict()
         finally:
             self._active_prompt = REVIEW_PROMPT
 
@@ -205,33 +201,41 @@ class CoordinatorAgent(BaseAgent):
                         break
 
             if "decision" in parsed:
-                return parsed
+                return ConvergenceDecision.from_dict(parsed).to_dict()
 
             # Handle variant schema: {"message": "..."} without decision key
             if "message" in parsed:
                 msg = parsed["message"].lower()
                 # Infer decision from message content
                 _APPROVE_SIGNALS = (
-                    "approve", "complete", "acceptable", "correct",
-                    "satisf", "no issue", "no remaining", "meets",
-                    "looks good", "well-implemented", "fully implemented",
-                    "covers the full", "all functions",
+                    "approve",
+                    "complete",
+                    "acceptable",
+                    "correct",
+                    "satisf",
+                    "no issue",
+                    "no remaining",
+                    "meets",
+                    "looks good",
+                    "well-implemented",
+                    "fully implemented",
+                    "covers the full",
+                    "all functions",
                 )
                 if any(w in msg for w in _APPROVE_SIGNALS):
-                    return {
-                        "decision": "approve",
-                        "reason": parsed["message"][:200],
-                        "tasks_to_rework": [],
-                    }
-                return {
-                    "decision": "rework",
-                    "reason": parsed["message"][:200],
-                    "tasks_to_rework": parsed.get("tasks_to_rework", []),
-                }
+                    return ConvergenceDecision(
+                        decision="approve",
+                        reason=parsed["message"][:200],
+                    ).to_dict()
+                return ConvergenceDecision(
+                    decision="rework",
+                    reason=parsed["message"][:200],
+                    tasks_to_rework=parsed.get("tasks_to_rework", []),
+                ).to_dict()
 
         # Default to rework if we can't parse — safer than blind approval
-        return {
-            "decision": "rework",
-            "reason": f"Could not parse coordinator response. Defaulting to rework. Raw: {raw[:200]}",
-            "tasks_to_rework": task_ids,
-        }
+        return ConvergenceDecision(
+            decision="rework",
+            reason=f"Could not parse coordinator response. Defaulting to rework. Raw: {raw[:200]}",
+            tasks_to_rework=task_ids,
+        ).to_dict()

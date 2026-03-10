@@ -3,7 +3,7 @@
 This module performs deterministic verification of generated Python code
 to catch bugs that the validator would only find at runtime:
 - Function calls without matching definitions
-- Undefined variable references  
+- Undefined variable references
 - Attribute access on unknown types
 - Unresolvable imports
 - Class usage without definitions
@@ -33,6 +33,7 @@ ERROR_ATTRIBUTE_ACCESS = "attribute_access"
 @dataclass
 class StaticCheckError:
     """A single static analysis error."""
+
     error_type: str
     file: str
     line: int
@@ -43,22 +44,30 @@ class StaticCheckError:
 
     def to_reviewer_format(self) -> dict:
         """Convert to reviewer-style issue format."""
-        severity = "critical" if self.error_type in (
-            ERROR_FUNCTION_DEFINED,
-            ERROR_CLASS_DEFINED,
-            ERROR_IMPORT_RESOLVED,
-        ) else "major"
-        return {
-            "severity": severity,
-            "file": self.file,
-            "description": self.message,
-            "suggestion": self.suggestion,
-        }
+        from the_bois.contracts import ReviewIssue
+
+        severity = (
+            "critical"
+            if self.error_type
+            in (
+                ERROR_FUNCTION_DEFINED,
+                ERROR_CLASS_DEFINED,
+                ERROR_IMPORT_RESOLVED,
+            )
+            else "major"
+        )
+        return ReviewIssue(
+            severity=severity,
+            file=self.file,
+            description=self.message,
+            suggestion=self.suggestion,
+        ).to_dict()
 
 
 @dataclass
 class StaticCheckResult:
     """Result of static analysis on a set of files."""
+
     passed: bool = True
     errors: list[StaticCheckError] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -72,7 +81,8 @@ class StaticCheckResult:
             "summary": (
                 f"Static analysis found {len(self.errors)} issue(s). "
                 "These are deterministic bugs that will fail at runtime."
-                if self.errors else "Static analysis passed."
+                if self.errors
+                else "Static analysis passed."
             ),
         }
 
@@ -152,7 +162,7 @@ class ReferenceChecker(ast.NodeVisitor):
     ) -> None:
         """Check if a name is defined or imported. Deduplicates by line+name."""
         line = node.lineno or 0
-        
+
         # Deduplicate: only report each name error once per line
         key = (line, name)
         if key in self._checked_names:
@@ -187,35 +197,41 @@ class ReferenceChecker(ast.NodeVisitor):
                 return
 
         if is_call:
-            self.errors.append(StaticCheckError(
-                error_type=ERROR_FUNCTION_DEFINED,
-                file=self.file_path,
-                line=node.lineno or 0,
-                column=node.col_offset,
-                name=name,
-                message=f"Function '{name}' is called but not defined or imported",
-                suggestion=f"Define '{name}()' or add proper import",
-            ))
+            self.errors.append(
+                StaticCheckError(
+                    error_type=ERROR_FUNCTION_DEFINED,
+                    file=self.file_path,
+                    line=node.lineno or 0,
+                    column=node.col_offset,
+                    name=name,
+                    message=f"Function '{name}' is called but not defined or imported",
+                    suggestion=f"Define '{name}()' or add proper import",
+                )
+            )
         elif name[0].isupper():
-            self.errors.append(StaticCheckError(
-                error_type=ERROR_CLASS_DEFINED,
-                file=self.file_path,
-                line=node.lineno or 0,
-                column=node.col_offset,
-                name=name,
-                message=f"Class '{name}' is used but not defined or imported",
-                suggestion=f"Define class '{name}' or add proper import",
-            ))
+            self.errors.append(
+                StaticCheckError(
+                    error_type=ERROR_CLASS_DEFINED,
+                    file=self.file_path,
+                    line=node.lineno or 0,
+                    column=node.col_offset,
+                    name=name,
+                    message=f"Class '{name}' is used but not defined or imported",
+                    suggestion=f"Define class '{name}' or add proper import",
+                )
+            )
         else:
-            self.errors.append(StaticCheckError(
-                error_type=ERROR_VARIABLE_DEFINED,
-                file=self.file_path,
-                line=node.lineno or 0,
-                column=node.col_offset,
-                name=name,
-                message=f"Variable '{name}' is used but not defined in scope",
-                suggestion=f"Define '{name}' before using it",
-            ))
+            self.errors.append(
+                StaticCheckError(
+                    error_type=ERROR_VARIABLE_DEFINED,
+                    file=self.file_path,
+                    line=node.lineno or 0,
+                    column=node.col_offset,
+                    name=name,
+                    message=f"Variable '{name}' is used but not defined in scope",
+                    suggestion=f"Define '{name}' before using it",
+                )
+            )
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         old_in_function = self._in_function
@@ -349,7 +365,9 @@ class ReferenceChecker(ast.NodeVisitor):
             self._check_name_defined(node.func.id, node, is_call=True)
         elif isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Name):
-                self._check_name_defined(node.func.value.id, node.func.value, is_call=False)
+                self._check_name_defined(
+                    node.func.value.id, node.func.value, is_call=False
+                )
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -360,29 +378,139 @@ class ReferenceChecker(ast.NodeVisitor):
 
 # Python builtins that don't need to be defined
 BUILTIN_NAMES: set[str] = {
-    "abs", "all", "any", "ascii", "bin", "bool", "breakpoint", "bytearray",
-    "bytes", "callable", "chr", "classmethod", "compile", "complex",
-    "delattr", "dict", "dir", "divmod", "enumerate", "eval", "exec",
-    "filter", "float", "format", "frozenset", "getattr", "globals", "hasattr",
-    "hash", "help", "hex", "id", "input", "int", "isinstance", "issubclass",
-    "iter", "len", "list", "locals", "map", "max", "memoryview", "min",
-    "next", "object", "oct", "open", "ord", "pow", "print", "property",
-    "range", "repr", "reversed", "round", "set", "setattr", "slice", "sorted",
-    "staticmethod", "str", "sum", "super", "tuple", "type", "vars", "zip",
-    "__import__", "True", "False", "None", "NotImplemented", "Ellipsis",
-    "Exception", "BaseException", "SystemExit", "KeyboardInterrupt",
-    "GeneratorExit", "StopIteration", "ArithmeticError", "LookupError",
-    "ValueError", "TypeError", "RuntimeError", "OSError", "IOError",
-    "FileNotFoundError", "PermissionError", "IndexError", "KeyError",
-    "AttributeError", "NameError", "ImportError", "SyntaxError",
-    "IndentationError", "TabError", "UnicodeDecodeError", "UnicodeEncodeError",
-    "UnicodeError", "OSError", "EnvironmentError", "AssertionError",
-    "EOFError", "FloatingPointError", "OverflowError", "ZeroDivisionError",
-    "PendingDeprecationWarning", "DeprecationWarning", "FutureWarning",
-    "ImportWarning", "RuntimeWarning", "SyntaxWarning", "UserWarning",
-    "Warning", "BufferError", "BytesWarning", "RegExpError", "timeout",
-    "json", "re", "os", "sys", "pathlib", "datetime", "collections",
-    "itertools", "functools", "operator", "abc", "copy", "io", "logging",
+    "abs",
+    "all",
+    "any",
+    "ascii",
+    "bin",
+    "bool",
+    "breakpoint",
+    "bytearray",
+    "bytes",
+    "callable",
+    "chr",
+    "classmethod",
+    "compile",
+    "complex",
+    "delattr",
+    "dict",
+    "dir",
+    "divmod",
+    "enumerate",
+    "eval",
+    "exec",
+    "filter",
+    "float",
+    "format",
+    "frozenset",
+    "getattr",
+    "globals",
+    "hasattr",
+    "hash",
+    "help",
+    "hex",
+    "id",
+    "input",
+    "int",
+    "isinstance",
+    "issubclass",
+    "iter",
+    "len",
+    "list",
+    "locals",
+    "map",
+    "max",
+    "memoryview",
+    "min",
+    "next",
+    "object",
+    "oct",
+    "open",
+    "ord",
+    "pow",
+    "print",
+    "property",
+    "range",
+    "repr",
+    "reversed",
+    "round",
+    "set",
+    "setattr",
+    "slice",
+    "sorted",
+    "staticmethod",
+    "str",
+    "sum",
+    "super",
+    "tuple",
+    "type",
+    "vars",
+    "zip",
+    "__import__",
+    "True",
+    "False",
+    "None",
+    "NotImplemented",
+    "Ellipsis",
+    "Exception",
+    "BaseException",
+    "SystemExit",
+    "KeyboardInterrupt",
+    "GeneratorExit",
+    "StopIteration",
+    "ArithmeticError",
+    "LookupError",
+    "ValueError",
+    "TypeError",
+    "RuntimeError",
+    "OSError",
+    "IOError",
+    "FileNotFoundError",
+    "PermissionError",
+    "IndexError",
+    "KeyError",
+    "AttributeError",
+    "NameError",
+    "ImportError",
+    "SyntaxError",
+    "IndentationError",
+    "TabError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "UnicodeError",
+    "OSError",
+    "EnvironmentError",
+    "AssertionError",
+    "EOFError",
+    "FloatingPointError",
+    "OverflowError",
+    "ZeroDivisionError",
+    "PendingDeprecationWarning",
+    "DeprecationWarning",
+    "FutureWarning",
+    "ImportWarning",
+    "RuntimeWarning",
+    "SyntaxWarning",
+    "UserWarning",
+    "Warning",
+    "BufferError",
+    "BytesWarning",
+    "RegExpError",
+    "timeout",
+    "json",
+    "re",
+    "os",
+    "sys",
+    "pathlib",
+    "datetime",
+    "collections",
+    "itertools",
+    "functools",
+    "operator",
+    "abc",
+    "copy",
+    "io",
+    "logging",
 }
 
 
@@ -399,7 +527,8 @@ def static_check_files(files: list[dict]) -> StaticCheckResult:
 
     # Filter to Python files only
     py_files = [
-        f for f in files
+        f
+        for f in files
         if f.get("path", "").endswith(".py") and f.get("content", "").strip()
     ]
 
@@ -430,13 +559,15 @@ def static_check_files(files: list[dict]) -> StaticCheckResult:
                 pass  # Already in collector
 
         except SyntaxError as e:
-            result.errors.append(StaticCheckError(
-                error_type="syntax",
-                file=path,
-                line=e.lineno or 0,
-                message=f"Syntax error: {e.msg}",
-                suggestion="Fix syntax before static analysis",
-            ))
+            result.errors.append(
+                StaticCheckError(
+                    error_type="syntax",
+                    file=path,
+                    line=e.lineno or 0,
+                    message=f"Syntax error: {e.msg}",
+                    suggestion="Fix syntax before static analysis",
+                )
+            )
             result.passed = False
 
     if not result.passed:
@@ -475,6 +606,135 @@ def static_check_files(files: list[dict]) -> StaticCheckResult:
     return result
 
 
+def verify_signatures(
+    files: list[dict],
+    signatures: list[dict],
+) -> list[dict]:
+    """Check that required function/method signatures exist in generated code.
+
+    Each signature dict should have at minimum ``file`` and ``name``.
+    If ``class_name`` is non-empty, the function must be a method of that class.
+
+    Only checks existence (name + scope), not parameter types or return types —
+    LLMs rename params too freely for exact matching to be useful.
+
+    Args:
+        files: List of {"path": str, "content": str} dicts.
+        signatures: List of SignatureSpec-like dicts.
+
+    Returns:
+        List of ReviewIssue-compatible dicts for each missing signature.
+        Empty list means all signatures found.
+    """
+    from the_bois.contracts import ReviewIssue
+
+    if not signatures:
+        return []
+
+    # Index files by path for fast lookup — normalise to basename and
+    # full path so "src/store.py" matches regardless of prefix.
+    files_by_path: dict[str, dict] = {}
+    for f in files:
+        p = f.get("path", "")
+        if p:
+            files_by_path[p] = f
+            # Also register by basename for fuzzy matching
+            files_by_path[PurePosixPath(p).name] = f
+
+    # Cache parsed ASTs so we don't re-parse per signature
+    parsed_cache: dict[str, ast.Module | None] = {}
+
+    def _parse(path: str) -> ast.Module | None:
+        if path in parsed_cache:
+            return parsed_cache[path]
+        fdata = files_by_path.get(path)
+        if fdata is None:
+            # Try basename match
+            fdata = files_by_path.get(PurePosixPath(path).name)
+        if fdata is None:
+            parsed_cache[path] = None
+            return None
+        try:
+            tree = ast.parse(fdata["content"], filename=path)
+        except SyntaxError:
+            parsed_cache[path] = None
+            return None
+        parsed_cache[path] = tree
+        return tree
+
+    issues: list[dict] = []
+
+    for sig in signatures:
+        sig_file = sig.get("file", "")
+        sig_name = sig.get("name", "")
+        sig_class = sig.get("class_name", "")
+
+        if not sig_file or not sig_name:
+            continue  # malformed spec, skip
+
+        tree = _parse(sig_file)
+        if tree is None:
+            issues.append(
+                ReviewIssue(
+                    severity="critical",
+                    file=sig_file,
+                    description=(
+                        f"Required file '{sig_file}' is missing or has syntax errors. "
+                        f"Expected to find {'method' if sig_class else 'function'} "
+                        f"'{sig_class + '.' if sig_class else ''}{sig_name}' here."
+                    ),
+                    suggestion=f"Create '{sig_file}' with the required implementation.",
+                ).to_dict()
+            )
+            continue
+
+        # Collect top-level functions and class methods from the AST
+        found = False
+
+        if sig_class:
+            # Look for a method inside a specific class
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name == sig_class:
+                    for item in node.body:
+                        if (
+                            isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                            and item.name == sig_name
+                        ):
+                            found = True
+                            break
+                if found:
+                    break
+        else:
+            # Look for a top-level function (not nested in a class)
+            for node in ast.iter_child_nodes(tree):
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == sig_name
+                ):
+                    found = True
+                    break
+
+        if not found:
+            label = f"{sig_class}.{sig_name}" if sig_class else sig_name
+            scope_hint = f" in class '{sig_class}'" if sig_class else " at module level"
+            issues.append(
+                ReviewIssue(
+                    severity="critical",
+                    file=sig_file,
+                    description=(
+                        f"Required {'method' if sig_class else 'function'} "
+                        f"'{label}' not found{scope_hint} in '{sig_file}'."
+                    ),
+                    suggestion=(
+                        f"Implement '{label}()'{scope_hint}. "
+                        f"The architect's task spec requires this signature."
+                    ),
+                ).to_dict()
+            )
+
+    return issues
+
+
 def static_check(files: list[dict]) -> list[dict]:
     """Convenience wrapper - returns list of issues in reviewer format.
 
@@ -486,3 +746,157 @@ def static_check(files: list[dict]) -> list[dict]:
     """
     result = static_check_files(files)
     return [e.to_reviewer_format() for e in result.errors]
+
+
+# ── Self-verification: task-level completeness checks ───────────────── #
+
+
+def self_verify(
+    files: list[dict],
+    task: dict,
+) -> StaticCheckResult:
+    """Verify generated code satisfies basic task-level expectations.
+
+    Unlike static_check_files (which catches undefined references),
+    this catches *semantic* gaps:
+      - Expected output files missing from generated code
+      - Empty / stub-only files (just ``pass`` or empty functions)
+      - Test files that don't import from any generated module
+
+    Cheap, deterministic, no LLM needed.  Run right after auto-repair
+    and before the full static check.
+
+    Args:
+        files: Generated code files as {"path": str, "content": str} dicts.
+        task: Task dict from the architect (has "output_files", "description").
+
+    Returns:
+        StaticCheckResult with any completeness issues found.
+    """
+    result = StaticCheckResult()
+    generated_paths = {f.get("path", "") for f in files if f.get("path")}
+    generated_stems = {
+        PurePosixPath(p).stem for p in generated_paths if p.endswith(".py")
+    }
+
+    # ── 1. Missing expected output files ──
+    expected_files = task.get("output_files", [])
+    for expected in expected_files:
+        if isinstance(expected, str) and expected not in generated_paths:
+            # Fuzzy match: maybe they put it in a subdirectory
+            basename = PurePosixPath(expected).name
+            if not any(p.endswith(basename) for p in generated_paths):
+                result.errors.append(
+                    StaticCheckError(
+                        error_type="missing_file",
+                        file=expected,
+                        line=0,
+                        name=expected,
+                        message=f"Expected output file '{expected}' is missing from generated code",
+                        suggestion=f"Create '{expected}' as specified in the task.",
+                    )
+                )
+
+    # ── 2. Empty / stub-only files ──
+    for f in files:
+        path = f.get("path", "")
+        content = f.get("content", "").strip()
+        if not path.endswith(".py") or not content:
+            continue
+
+        # Skip __init__.py — it's fine to be empty
+        if PurePosixPath(path).name == "__init__.py":
+            continue
+
+        try:
+            tree = ast.parse(content, filename=path)
+        except SyntaxError:
+            continue  # static_check will catch this
+
+        # Check if every function body is just `pass` or `...`
+        has_real_code = False
+        func_count = 0
+        stub_count = 0
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_count += 1
+                body = node.body
+                # A stub is: only Pass, Expr(Constant(...)), or docstring + pass
+                real_stmts = [
+                    s
+                    for s in body
+                    if not isinstance(s, ast.Pass)
+                    and not (
+                        isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant)
+                    )
+                ]
+                if real_stmts:
+                    has_real_code = True
+                else:
+                    stub_count += 1
+
+        if func_count > 0 and stub_count == func_count and not has_real_code:
+            result.errors.append(
+                StaticCheckError(
+                    error_type="stub_only",
+                    file=path,
+                    line=0,
+                    name=path,
+                    message=(
+                        f"File '{path}' has {func_count} function(s) but ALL are "
+                        f"stubs (just 'pass' or '...'). No real implementation."
+                    ),
+                    suggestion="Implement the function bodies instead of leaving stubs.",
+                )
+            )
+
+    # ── 3. Test files that don't import from any generated module ──
+    for f in files:
+        path = f.get("path", "")
+        content = f.get("content", "").strip()
+        if not path.endswith(".py") or not content:
+            continue
+
+        name = PurePosixPath(path).name
+        is_test = (
+            name.startswith("test_")
+            or name.endswith("_test.py")
+            or name == "conftest.py"
+        )
+        if not is_test:
+            continue
+
+        try:
+            tree = ast.parse(content, filename=path)
+        except SyntaxError:
+            continue
+
+        # Collect all top-level import targets
+        imported_modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported_modules.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    imported_modules.add(node.module.split(".")[0])
+
+        # Check if any import refers to a generated module
+        imports_generated = imported_modules & generated_stems
+        if not imports_generated:
+            # Also check if any name from generated files appears in imports
+            # (handles "from mypackage.module import ..." patterns)
+            all_generated_parts = set()
+            for gp in generated_paths:
+                if gp.endswith(".py"):
+                    all_generated_parts.update(PurePosixPath(gp).parts)
+            imports_generated = imported_modules & all_generated_parts
+
+        if not imports_generated:
+            result.warnings.append(
+                f"Test file '{path}' doesn't import from any generated module. "
+                f"It may be testing the wrong thing or using incorrect import paths."
+            )
+
+    result.passed = len(result.errors) == 0
+    return result

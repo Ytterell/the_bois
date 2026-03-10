@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import json
-
 from the_bois.agents.base import BaseAgent
+from the_bois.contracts import ReviewFeedback, ReviewIssue
 from the_bois.memory.ledger import MessageType
 from the_bois.utils import parse_json_response
 
@@ -35,7 +34,15 @@ RULE 4 — DATA LIFECYCLE:
   ☐ Round-trip: save → load produces equivalent objects
   ☐ No orphan fields that exist in __init__ but are never persisted
 
-RULE 5 — SECONDARY CHECKS (major, not fatal):
+RULE 5 — DO NOT INVENT API NAMES:
+  ☐ When suggesting fixes, ONLY reference API names that appear in the \
+API REFERENCE section (if provided) or in the existing codebase
+  ☐ If you suspect an API name is wrong but don't know the correct one, \
+flag it as: "Possibly wrong API — needs research" instead of suggesting \
+an alternative you are not sure about
+  ☐ NEVER suggest method/attribute/class names you haven't verified
+
+RULE 6 — SECONDARY CHECKS (major, not fatal):
   ☐ Hardcoded paths assuming a specific working directory
   ☐ Missing error handling for file I/O or user input
   ☐ Security issues (injection, unsafe deserialization)
@@ -107,7 +114,19 @@ class ReviewerAgent(BaseAgent):
         for f in code.get("files", []):
             files_summary += f"\n--- {f['path']} ---\n{f['content']}\n"
 
+        research_bank: dict[str, str] = input_data.get("research_bank", {})
+
         prompt = ""
+
+        # Inject research bank so reviewer can cross-reference API names
+        if research_bank:
+            prompt += (
+                "\n**📚 API REFERENCE (from documentation — use these to verify "
+                "API names in the code, do NOT suggest names not in this reference):**\n"
+            )
+            for _query, ref in research_bank.items():
+                prompt += f"{ref}\n\n"
+            prompt += "---\n\n"
 
         # Warn the reviewer when its last approval was overridden
         if last_validation_error:
@@ -172,7 +191,8 @@ class ReviewerAgent(BaseAgent):
         }
 
         raw = await self.think(
-            prompt, json_schema=_REVIEWER_SCHEMA,
+            prompt,
+            json_schema=_REVIEWER_SCHEMA,
             task_description=task.get("description", task.get("title", "")),
             task_id=task.get("id"),
         )
@@ -187,22 +207,41 @@ class ReviewerAgent(BaseAgent):
         parsed = parse_json_response(raw)
         if parsed:
             if "approved" in parsed:
-                return parsed
+                return ReviewFeedback.from_dict(parsed).to_dict()
 
             # Handle variant schemas from sloppy models
             # e.g. {"consistency": 1, "explanation": "..."}
             if "consistency" in parsed:
-                return {
-                    "approved": parsed["consistency"] == 1,
-                    "issues": parsed.get("issues", []),
-                    "summary": parsed.get("explanation", parsed.get("summary", "")),
-                }
+                return ReviewFeedback(
+                    approved=parsed["consistency"] == 1,
+                    issues=[ReviewIssue.from_dict(i) for i in parsed.get("issues", [])],
+                    summary=parsed.get("explanation", parsed.get("summary", "")),
+                ).to_dict()
+
+        # Fallback: assume rejection if we can't parse (safer than blind approval)
+        return ReviewFeedback(
+            approved=False,
+            issues=[
+                ReviewIssue(
+                    severity="critical",
+                    file="unknown",
+                    description="Reviewer response could not be parsed.",
+                    suggestion="Please re-review and respond in the required JSON format.",
+                )
+            ],
+            summary=f"Could not parse review response. Raw: {raw[:300]}",
+        ).to_dict()
 
         # Fallback: assume rejection if we can't parse (safer than blind approval)
         return {
             "approved": False,
-            "issues": [{"severity": "critical", "file": "unknown",
-                        "description": "Reviewer response could not be parsed.",
-                        "suggestion": "Please re-review and respond in the required JSON format."}],
+            "issues": [
+                {
+                    "severity": "critical",
+                    "file": "unknown",
+                    "description": "Reviewer response could not be parsed.",
+                    "suggestion": "Please re-review and respond in the required JSON format.",
+                }
+            ],
             "summary": f"Could not parse review response. Raw: {raw[:300]}",
         }

@@ -23,6 +23,7 @@ class OrchestrationConfig:
     max_global_iterations: int = 5
     context_max_messages: int = 20
     global_timeout: int = 14400  # 4 hours wall-clock max
+    sandbox_inherit_venv: bool = True  # expose project venv packages to validator sandbox
 
 
 @dataclass
@@ -47,11 +48,11 @@ class MemoryConfig:
 
 
 DEFAULTS: dict[str, AgentConfig] = {
-    "coordinator": AgentConfig(model="mistral:7b", temperature=0.3),
-    "architect": AgentConfig(model="mistral:7b", temperature=0.4),
+    "coordinator": AgentConfig(model="qwen2.5:14b", temperature=0.2),
+    "architect": AgentConfig(model="qwen2.5:14b", temperature=0.2),
     "coder": AgentConfig(model="qwen2.5-coder:14b", temperature=0.2),
-    "reviewer": AgentConfig(model="qwen2.5-coder:14b", temperature=0.3),
-    "researcher": AgentConfig(model="phi3:3.8b", temperature=0.5),
+    "reviewer": AgentConfig(model="qwen2.5-coder:14b", temperature=0.1),
+    "researcher": AgentConfig(model="qwen2.5:14b", temperature=0.3),
 }
 
 

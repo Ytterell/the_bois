@@ -95,6 +95,7 @@ _RESEARCHER_RESULT = json.dumps({
     "findings": "No research needed for this task.",
     "relevant_code": "",
     "key_points": [],
+    "confidence": "high",
 })
 
 # Planning phase response (for two-phase coder)

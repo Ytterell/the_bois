@@ -41,7 +41,10 @@ async def get_memory_context(
     if agent_name in ("coder", "reviewer") and task_description:
         try:
             examples = await memory.examples.get_relevant_examples(
-                client, agent_name, task_description, top_k=1,
+                client,
+                agent_name,
+                task_description,
+                top_k=1,
             )
 
             gold = examples.get("gold", [])
@@ -72,7 +75,13 @@ async def get_memory_context(
     try:
         warnings = memory.mistakes.get_warnings_for(agent_name, top_k=3)
         if warnings:
-            warning_block = "\n".join(f"  ⚠ {w}" for w in warnings)
+            # Warnings may be multi-line (pattern + fix), indent consistently
+            warning_lines: list[str] = []
+            for w in warnings:
+                for i, line in enumerate(w.split("\n")):
+                    prefix = "  ⚠ " if i == 0 else "    "
+                    warning_lines.append(f"{prefix}{line}")
+            warning_block = "\n".join(warning_lines)
             sections.append(
                 "🚨 PAST MISTAKES (you have repeatedly made these errors — do NOT repeat them):\n"
                 + warning_block
@@ -84,7 +93,9 @@ async def get_memory_context(
     if agent_name in ("coordinator", "architect") and scope:
         try:
             episodes = await memory.episodes.find_similar_episodes(
-                client, scope, top_k=1,
+                client,
+                scope,
+                top_k=1,
             )
             if episodes:
                 ep = episodes[0]
@@ -110,6 +121,8 @@ async def get_memory_context(
     )
 
     if len(full_block) > max_chars:
-        full_block = full_block[:max_chars] + "\n... (truncated)\n═══ END MEMORY CONTEXT ═══\n\n"
+        full_block = (
+            full_block[:max_chars] + "\n... (truncated)\n═══ END MEMORY CONTEXT ═══\n\n"
+        )
 
     return full_block

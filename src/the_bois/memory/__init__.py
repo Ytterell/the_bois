@@ -87,6 +87,8 @@ class MemoryStore:
                     pattern=lesson.rejection_reason,
                     severity=lesson.severity,
                     embedding_model=emb_model,
+                    root_cause=lesson.root_cause,
+                    fix_approach=lesson.fix_approach,
                 )
 
         # Save episode

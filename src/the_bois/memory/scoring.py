@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 @dataclass
 class AgentMetrics:
     """Performance metrics for a single agent."""
+
     tasks_attempted: int = 0
     tasks_approved: int = 0
     total_iterations: int = 0
@@ -38,6 +39,7 @@ class AgentMetrics:
 @dataclass
 class RunScore:
     """Aggregate scoring for a complete run."""
+
     tasks_total: int = 0
     tasks_passed: int = 0
     tasks_failed: int = 0
@@ -72,12 +74,15 @@ class RunScore:
 @dataclass
 class Lesson:
     """A single extracted lesson from a run."""
+
     type: str  # "gold_example", "anti_example", "mistake"
     agent: str
     task_description: str
     output_snippet: str = ""
     rejection_reason: str = ""
     severity: str = "medium"
+    root_cause: str = ""
+    fix_approach: str = ""
 
 
 def score_run(all_results: dict) -> RunScore:
@@ -133,9 +138,10 @@ def extract_lessons(all_results: dict) -> list[Lesson]:
     """Extract actionable lessons from run results.
 
     Identifies:
-    - Gold examples: tasks approved on the first try (iterations == 1)
-    - Anti-examples: tasks that failed all review iterations
-    - Mistakes: rejection reasons from failed reviews
+    - Gold examples: first-try approvals on non-trivial tasks
+    - Anti-examples: total failures (excluding dependency cascades)
+    - Coder mistakes: rejection reasons from failed reviews
+    - Reviewer mistakes: when reviewer approved but validation failed
     """
     lessons: list[Lesson] = []
 
@@ -149,6 +155,11 @@ def extract_lessons(all_results: dict) -> list[Lesson]:
         approved = review.get("approved", False)
         iterations = result.get("iterations", 0)
         task_desc = task.get("description", task.get("title", ""))
+        reviewer_misses = result.get("reviewer_misses", 0)
+
+        # Skip dependency cascades — if a prerequisite failed and the task
+        # description was merged, the coder isn't really at fault
+        is_cascade = task_desc.startswith("NOTE: A prerequisite task failed")
 
         # Build output snippet from code files
         files = code.get("files", [])
@@ -159,43 +170,82 @@ def extract_lessons(all_results: dict) -> list[Lesson]:
             snippet_parts.append(f"--- {path} ---\n{content}")
         output_snippet = "\n".join(snippet_parts)
 
-        if approved and iterations == 1:
-            # Gold example — first-try approval, the coder cooked
-            lessons.append(Lesson(
-                type="gold_example",
-                agent="coder",
-                task_description=task_desc,
-                output_snippet=output_snippet,
-            ))
+        # --- Gold examples: first-try approval on non-trivial tasks ---
+        # Require iterations == 1 AND a reasonable task (more than one file
+        # or code length > 200 chars to filter out `add(a, b)` junk)
+        if approved and iterations == 1 and not is_cascade:
+            total_code_len = sum(len(f.get("content", "")) for f in files)
+            is_nontrivial = len(files) >= 2 or total_code_len > 200
+            if is_nontrivial:
+                lessons.append(
+                    Lesson(
+                        type="gold_example",
+                        agent="coder",
+                        task_description=task_desc,
+                        output_snippet=output_snippet,
+                    )
+                )
 
-        elif not approved:
-            # Anti-example — total failure
+        elif not approved and not is_cascade:
+            # Anti-example — total failure, but only if coder actually tried
             rejection = review.get("summary", "")
             issues = review.get("issues", [])
-            issue_text = "; ".join(
-                i.get("description", "") for i in issues[:3]
+            issue_text = "; ".join(i.get("description", "") for i in issues[:3])
+            full_reason = (
+                f"{rejection} | Issues: {issue_text}" if issue_text else rejection
             )
-            full_reason = f"{rejection} | Issues: {issue_text}" if issue_text else rejection
 
-            lessons.append(Lesson(
-                type="anti_example",
-                agent="coder",
-                task_description=task_desc,
-                output_snippet=output_snippet,
-                rejection_reason=full_reason,
-            ))
+            # Aggregate suggestions from all issues for the anti-example
+            suggestions = [
+                i.get("suggestion", "") for i in issues if i.get("suggestion")
+            ]
+            combined_fix = "; ".join(suggestions[:3])
+
+            lessons.append(
+                Lesson(
+                    type="anti_example",
+                    agent="coder",
+                    task_description=task_desc,
+                    output_snippet=output_snippet,
+                    rejection_reason=full_reason,
+                    root_cause=issue_text,
+                    fix_approach=combined_fix,
+                )
+            )
 
             # Also record as a mistake pattern if there are specific issues
             for issue in issues:
                 desc = issue.get("description", "")
                 sev = issue.get("severity", "medium")
+                suggestion = issue.get("suggestion", "")
                 if desc:
-                    lessons.append(Lesson(
-                        type="mistake",
-                        agent="coder",
-                        task_description=task_desc,
-                        rejection_reason=desc,
-                        severity=sev if sev in ("low", "medium", "high") else "medium",
-                    ))
+                    lessons.append(
+                        Lesson(
+                            type="mistake",
+                            agent="coder",
+                            task_description=task_desc,
+                            rejection_reason=desc,
+                            severity=sev
+                            if sev in ("low", "medium", "high")
+                            else "medium",
+                            fix_approach=suggestion,
+                        )
+                    )
+
+        # --- Reviewer lessons: approved code that then failed validation ---
+        if reviewer_misses > 0:
+            lessons.append(
+                Lesson(
+                    type="mistake",
+                    agent="reviewer",
+                    task_description=task_desc,
+                    rejection_reason=(
+                        f"Reviewer approved code that failed validation "
+                        f"({reviewer_misses} miss(es)). Be more thorough — "
+                        f"check imports, runtime errors, and test correctness."
+                    ),
+                    severity="high",
+                )
+            )
 
     return lessons

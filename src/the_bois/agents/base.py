@@ -27,12 +27,14 @@ class BaseAgent(ABC):
         client: OllamaClient,
         ledger: Ledger,
         memory: MemoryStore | None = None,
+        context_max_messages: int = 20,
     ) -> None:
         self.name = name
         self.config = config
         self.client = client
         self.ledger = ledger
         self.memory = memory
+        self._context_max_messages = context_max_messages
         # Orchestrator can override temperature per-call (e.g. ramp on retry)
         self._temperature_override: float | None = None
 
@@ -71,7 +73,8 @@ class BaseAgent(ABC):
             log.warning(
                 "%s: tight context budget (%d tokens remaining after system+prompt). "
                 "Ledger and memory will be minimal.",
-                self.name, remaining,
+                self.name,
+                remaining,
             )
 
         return ledger_budget, memory_budget
@@ -99,7 +102,9 @@ class BaseAgent(ABC):
 
         # ── Inject ledger history within budget (newest first) ──
         ledger_messages = self.ledger.get_context_for_agent(
-            self.name, task_id=task_id,
+            self.name,
+            max_messages=self._context_max_messages,
+            task_id=task_id,
         )
         used_tokens = 0
         budgeted_msgs: list[tuple[str, str]] = []  # (role, content)
@@ -162,6 +167,7 @@ class BaseAgent(ABC):
         self,
         prompt: str,
         task_description: str = "",
+        scope: str = "",
         task_id: str | None = None,
     ) -> str:
         """Like think(), but streams tokens and shows a live progress indicator.
@@ -181,7 +187,9 @@ class BaseAgent(ABC):
 
         # Ledger (same logic as think)
         ledger_messages = self.ledger.get_context_for_agent(
-            self.name, task_id=task_id,
+            self.name,
+            max_messages=self._context_max_messages,
+            task_id=task_id,
         )
         used_tokens = 0
         budgeted_msgs: list[tuple[str, str]] = []
@@ -204,11 +212,13 @@ class BaseAgent(ABC):
         if self.memory and self.memory.enabled:
             try:
                 from the_bois.memory.injection import get_memory_context
+
                 memory_prefix = await get_memory_context(
                     client=self.client,
                     memory=self.memory,
                     agent_name=self.name,
                     task_description=task_description,
+                    scope=scope,
                     max_chars=memory_budget * 4,
                 )
             except Exception:
@@ -239,10 +249,12 @@ class BaseAgent(ABC):
                 token_count += 1
                 if token_count % 10 == 0:  # update every 10 tokens
                     chars = sum(len(t) for t in accumulated)
-                    live.update(RichText(
-                        f"  ✏️  Generating... {token_count} tokens ({chars} chars)",
-                        style="dim",
-                    ))
+                    live.update(
+                        RichText(
+                            f"  ✏️  Generating... {token_count} tokens ({chars} chars)",
+                            style="dim",
+                        )
+                    )
 
         return "".join(accumulated)
 

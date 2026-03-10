@@ -10,9 +10,11 @@ that argue with each other until the code works.
 A problem scope goes in. The Coordinator analyzes it, the Researcher digs
 up docs if needed, the Architect breaks it into tasks, the Coder writes
 the implementation, the Reviewer tears it apart, and the Validator
-actually runs it. If something fails, the loop retries with escalating
-temperature until the agents produce something that compiles, passes
-tests, and survives review — or until the iteration budget runs out.
+actually runs it. If something fails, errors are classified by an error
+taxonomy that picks a targeted retry strategy — adjusting temperature,
+triggering research, or adding specific hints — until the agents produce
+something that compiles, passes tests, and survives review, or until the
+iteration budget runs out.
 
 The system learns across runs: gold examples, anti-patterns, and full
 episode histories are persisted to a JSON-backed memory layer and injected
@@ -44,7 +46,8 @@ into future prompts via embedding similarity search.
     +---------+---------+                                 |
     |     Architect      |<--- research findings ---------+
     | (task decompose,   |
-    |  2-6 subtasks)     |
+    |  2-6 subtasks,     |
+    |  structured specs) |
     +---------+---------+
               |
               |  for each task:
@@ -56,6 +59,21 @@ into future prompts via embedding similarity search.
     +---------+---------+     +--------+----------+
               |                         |
               v                         v
+    +---------+-------------------------+---------+
+    |         Self-Verify (task completeness)      |
+    |  missing expected files, stub-only code,     |
+    |  test files that don't import modules        |
+    +---------+-----------------------------------+
+              |
+              v
+    +---------+-------------------------+---------+
+    |           Static Analysis (AST)             |
+    |  static_check: undefined refs, bad imports  |
+    |  verify_signatures: architect-required APIs  |
+    +---------+-----------------------------------+
+              |
+              | if static OK:
+              v
     +---------+-------------------------+---------+
     |              Validator (sandbox)             |
     |  validate_fast(): syntax + imports          |
@@ -88,14 +106,17 @@ Coordinator.analyze_scope()
   |
   +--> Researcher.execute()            [if external libs detected]
   |
-  +--> Architect.execute()             [decomposes into 2-6 tasks]
+  +--> Architect.execute()             [decomposes into 2-6 tasks with optional structured specs]
   |
   +--> for each task:
   |      |
   |      +--> Coder.execute()          [two-phase: plan then code]
   |      |      |
   |      |      +--> auto_repair()     [deterministic fixes]
-  |      |      +--> validate_fast()   [syntax + imports]
+  |      |      +--> self_verify()     [task completeness check]
+  |      |      +--> static_check()    [AST: undefined refs, bad imports]
+  |      |      +--> verify_sigs()     [architect-required signatures exist?]
+  |      |      +--> validate_fast()   [syntax + imports in sandbox]
   |      |      |
   |      |      +--> Reviewer.execute()
   |      |      |      |
@@ -191,6 +212,15 @@ Each entry needs: `agent`, `role` ("gold"/"anti"), `task_description`,
 the-bois status
 ```
 
+### View run trace
+
+Each run writes a `trace.jsonl` file with timing spans for every pipeline
+stage. View a human-readable summary with:
+
+```bash
+the-bois trace workspace/run_2026-03-01_00-32-28/
+```
+
 ## Configuration
 
 `config.yaml` in the project root. Structure:
@@ -242,7 +272,10 @@ task description. Capped at `max_examples`.
 
 **MistakeJournal** — Frequency-tracked anti-patterns per agent. Uses
 cosine similarity (threshold > 0.85) for fuzzy dedup. Only surfaces
-warnings when a pattern has been seen 2+ times.
+warnings when a pattern has been seen 2+ times. Each mistake entry
+includes structured root cause and fix approach fields extracted from
+reviewer feedback, so injected warnings tell the coder *why* it went
+wrong and *how to fix it*, not just "don't do this".
 
 **EpisodeStore** — Full run histories indexed by scope embedding. Gives
 the coordinator and architect "last time we tried something like this"
@@ -252,30 +285,82 @@ Memory injection happens in `memory/injection.py`, called by
 `BaseAgent.think()`. Memory context is prepended to the user prompt,
 capped at 35% of the remaining context window budget.
 
+## Typed Contracts
+
+All data flowing between agents is defined in `contracts.py` — the
+single source of truth for agent I/O shapes.
+
+**Core objects** are `@dataclass`es with `to_dict()` / `from_dict()`
+round-trip methods: `FileSpec`, `ReviewIssue`, `ReviewFeedback`,
+`SignatureSpec`, `TaskSpec`, `ScopeAnalysis`, `ConvergenceDecision`,
+`ResearchResult`, `CodeOutput`, `TaskResult`.
+
+**Agent input parameter bags** are `TypedDict`s: `CoderInput`,
+`ReviewerInput`, `ArchitectInput`, `ResearcherInput`,
+`CoordinatorDecisionInput`. These document the expected keys without
+imposing runtime overhead.
+
+Agents construct contract types internally but return `.to_dict()` for
+backward compatibility with the orchestrator and checkpoint
+serialization. The migration is incremental — `from_dict()` at
+boundaries handles legacy dicts gracefully.
+
+The architect can now emit **structured task specs** with optional
+`required_files`, `required_signatures` (list of `SignatureSpec`), and
+`acceptance_criteria` fields. These enable mechanical verification
+before the reviewer sees the code — missing functions are caught by
+AST analysis, not wasted LLM tokens.
+
 ## Validation
 
-All generated code is executed in a sandboxed subprocess with resource
-limits:
+All generated code passes through a five-stage gauntlet before the
+reviewer LLM sees it. Each stage that fails sends feedback directly to
+the coder, skipping downstream stages to avoid wasting time.
+
+### Pre-reviewer gates (deterministic, no LLM cost)
+
+1. **Auto-repair** (`tools/repair.py`) — Unicode-to-ASCII replacement,
+   trailing whitespace cleanup, blank line collapse, missing
+   `__init__.py` generation. Prevents burning a coder iteration on
+   purely mechanical issues.
+
+2. **Self-verification** (`tools/static_check.py:self_verify`) —
+   Task-level completeness check: missing expected files, stub-only
+   implementations, test files that don't import generated modules.
+   Catches "wrote boilerplate but forgot the actual code" before
+   wasting LLM tokens on static analysis.
+
+3. **Static analysis** (`tools/static_check.py`) — AST-based structural
+   verification: undefined function calls, missing class definitions,
+   unresolvable imports, undefined variables. Deterministic bugs that
+   would fail at runtime are caught here without executing anything.
+
+4. **Signature verification** (`tools/static_check.py:verify_signatures`)
+   — If the architect's task spec includes `required_signatures`, each
+   one is checked against the AST. Missing functions or methods are
+   reported as critical issues. Only activates when the architect emits
+   structured specs.
+
+5. **Fast validation** (`tools/validator.py:validate_fast`) — Actual
+   execution in a sandboxed subprocess: syntax check + import
+   resolution. If this fails, the reviewer is skipped entirely.
+
+### Post-reviewer validation
+
+6. **Full validation** (`tools/validator.py:validate_full`) — Everything
+   in fast, plus pytest execution. Runs after reviewer approval.
+   Skips redundant syntax/import checks when fast validation already
+   passed. If tests fail, the reviewer's approval is overridden and
+   the coder gets another shot.
+
+### Sandbox limits
+
+All code execution runs in a subprocess with resource limits:
 
 - `RLIMIT_AS`: 512 MB address space
 - `RLIMIT_CPU`: 30 seconds CPU time
 - `RLIMIT_FSIZE`: 50 MB max file writes
 - `RLIMIT_NPROC`: 50 max child processes
-
-Two validation tiers:
-
-1. **validate_fast()** — Syntax check + import check. Runs before the
-   reviewer sees the code. If this fails, the reviewer is skipped
-   entirely and errors go straight back to the coder.
-
-2. **validate_full()** — Everything in fast, plus pytest execution. Runs
-   after reviewer approval. If tests fail, the reviewer's approval is
-   overridden and the coder gets another shot.
-
-An auto-repair step (`tools/repair.py`) runs before validation:
-Unicode-to-ASCII replacement, trailing whitespace cleanup, blank line
-collapse, missing `__init__.py` generation. This prevents burning a
-coder iteration on purely mechanical issues.
 
 ## Project Structure
 
@@ -294,15 +379,18 @@ the_bois/
       *.py                     # generated code files
       checkpoint.json          # task status snapshot
       ledger.json              # full message log
+      trace.jsonl              # timing spans for pipeline stages
   src/the_bois/
-    cli.py                     # typer CLI (run, seed-memory, status)
+    cli.py                     # typer CLI (run, seed-memory, status, trace)
     config.py                  # dataclass configs, YAML loader, defaults
+    contracts.py               # typed agent I/O contracts (dataclasses + TypedDicts)
+    log.py                     # two-tier logging setup (file=DEBUG, console=WARNING+)
     orchestrator.py            # main pipeline loop, retry logic
     utils.py                   # JSON parsing, token estimation, file parsing
     agents/
       base.py                  # BaseAgent ABC (think, think_stream, ledger)
       coordinator.py           # scope analysis, approve/rework/replan
-      architect.py             # task decomposition
+      architect.py             # task decomposition with structured specs
       coder.py                 # two-phase code generation (plan + implement)
       researcher.py            # PyPI / GitHub / DuckDuckGo search
       reviewer.py              # code review with structured issue output
@@ -318,8 +406,13 @@ the_bois/
       ollama.py                # OllamaClient (chat, chat_stream, embeddings)
       mock.py                  # MockOllamaClient for dry-run / testing
     tools/
+      context.py               # context optimization, file chunking for agents
+      deps.py                  # auto-dependency installer (PyPI resolve + sandbox)
+      error_taxonomy.py        # error classification + targeted retry strategies
       repair.py                # deterministic auto-repair (unicode, whitespace)
       search.py                # web search utilities
+      static_check.py          # AST-based static analysis + signature verification + self-verify
+      tracing.py               # span-based run tracer (JSON Lines output)
       validator.py             # sandbox execution, syntax/import/test checks
       workspace.py             # file I/O for run output directories
 ```
@@ -336,9 +429,13 @@ Parsed by `utils.parse_delimited_files()`.
 (feedback present), planning is skipped to avoid wasting tokens
 re-explaining the same approach.
 
-**Temperature ramping** — The orchestrator bumps coder temperature by
-+0.2 per retry iteration (capped at 1.0) to encourage different
-approaches. Reset between tasks.
+**Error taxonomy** — Each validation failure is classified into one of
+14 error categories (syntax, import, logic, API misuse, etc.), each
+mapped to a `RetryStrategy` that controls temperature adjustment,
+whether to trigger research, and what hints to inject. Replaces blind
++0.2 temperature ramping with targeted recovery — an import error gets
+research, a logic error gets a temperature bump, a test failure gets
+the traceback fed back verbatim.
 
 **Prompt ordering** — Local models attend most strongly to content that
 appears last. The coder prompt places reference material first, then
@@ -349,15 +446,29 @@ breaks output quality.
 and only sends changed files to the reviewer. Prevents token waste on
 code the reviewer has already approved.
 
-**Reactive research** — When validation fails with `AttributeError`,
-`TypeError`, or `ModuleNotFoundError`, the orchestrator extracts
-targeted queries from the traceback and dispatches the researcher
-mid-task to fetch correct API docs. Results are cached in
-`research_bank` for the duration of the run.
+**Reactive research** — When validation fails with errors classified as
+import-related, API misuse, or type errors by the error taxonomy, the
+orchestrator dispatches the researcher mid-task to fetch correct API
+docs. Only triggers when the taxonomy's retry strategy says
+`should_research=True`. Results are cached in `research_bank` for the
+duration of the run.
 
 **Safe fallbacks** — Agent responses that fail to parse JSON default to
 rejection/rework, never silent approval. The system would rather retry
 than ship broken code it can't verify.
+
+**Progressive prompt compression** — When existing codebase context
+exceeds the coder's remaining token budget, files are progressively
+compressed through four levels: full source (level 0), comments/docstrings
+stripped (level 1), signatures only (level 2), names only (level 3).
+The compressor tries each level until the context fits. Prevents the
+coder from running out of context window on large codebases.
+
+**Run tracing** — Every pipeline stage is wrapped in a timing span
+that writes to `trace.jsonl` in the workspace directory. Spans record
+wall-clock duration, task ID, and metadata (error messages, model
+names). Useful for identifying bottlenecks — `the-bois trace <run_dir>`
+renders a summary table.
 
 ## Dependencies
 

@@ -13,10 +13,15 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from the_bois.memory.embeddings import embed_text, find_most_similar
+from the_bois.memory.embeddings import cosine_similarity, embed_text, find_most_similar
 
 if TYPE_CHECKING:
     from the_bois.models.ollama import OllamaClient
+
+# Similarity above this threshold = near-duplicate, update instead of insert
+_DEDUP_THRESHOLD = 0.85
+# Similarity below this floor = irrelevant match, don't return
+_RELEVANCE_FLOOR = 0.3
 
 
 class ExampleBank:
@@ -49,7 +54,12 @@ class ExampleBank:
         rejection_reason: str = "",
         embedding_model: str = "nomic-embed-text",
     ) -> None:
-        """Add a new example, embedding the task description for future retrieval."""
+        """Add a new example, deduplicating by cosine similarity.
+
+        If a same-agent, same-role example is already stored with
+        similarity > 0.85, the existing entry is updated in-place
+        (fresher timestamp wins).  Otherwise a new entry is appended.
+        """
         embedding = await embed_text(client, task_description, model=embedding_model)
 
         entry = {
@@ -61,6 +71,26 @@ class ExampleBank:
             "embedding": embedding,
             "timestamp": time.time(),
         }
+
+        # --- dedup: check for near-duplicate among same agent+role ---
+        if embedding:
+            same = [
+                (i, e)
+                for i, e in enumerate(self._examples)
+                if e.get("agent") == agent
+                and e.get("role") == role
+                and e.get("embedding")
+            ]
+            for idx, existing in same:
+                if (
+                    cosine_similarity(embedding, existing["embedding"])
+                    > _DEDUP_THRESHOLD
+                ):
+                    # Update the existing entry instead of creating a duplicate
+                    self._examples[idx] = entry
+                    self.save()
+                    return
+
         self._examples.append(entry)
         self._prune()
         self.save()
@@ -99,8 +129,8 @@ class ExampleBank:
         anti_matches = find_most_similar(query_vec, anti, top_k=top_k)
 
         return {
-            "gold": [item for item, _score in gold_matches],
-            "anti": [item for item, _score in anti_matches],
+            "gold": [item for item, score in gold_matches if score >= _RELEVANCE_FLOOR],
+            "anti": [item for item, score in anti_matches if score >= _RELEVANCE_FLOOR],
         }
 
     @property
